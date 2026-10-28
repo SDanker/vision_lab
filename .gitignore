@@ -1,0 +1,43 @@
+# --- Secretos y configuración local (NUNCA subir) ---
+.env
+.env.*
+!.env.example
+backups/
+*.dump
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.coverage
+htmlcov/
+
+# --- Node / frontend ---
+node_modules/
+dist/
+*.tsbuildinfo
+
+# --- Datos generados por la plataforma (imágenes, modelos, snapshots) ---
+data/
+vision-datos/
+*.keras
+*.h5
+*.tflite
+*.onnx
+
+# --- Archivos comprimidos / temporales ---
+*.zip
+*.tar.gz
+*.log
+*.tmp
+
+# --- Editores y sistema operativo ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,187 @@
+# Vision Lab AI — despliegue autohospedado
+#   1) ./scripts/init-env.sh   (o .\scripts\init-env.ps1 en Windows)  -> genera .env con secretos aleatorios
+#   2) docker compose up -d --build
+#
+# Presupuesto de RAM por defecto (suma ≈ 19,9 GB, bajo el máximo de 20 GB):
+#   entrenamiento 14g + api 2g + db 1g + redis 0,5g + worker-light 2g + beat 0,25g + web 0,125g
+# Ajusta los límites con las variables *_MEM_LIMIT del archivo .env.
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+psycopg://vision:${POSTGRES_PASSWORD:?Ejecuta scripts/init-env.sh para crear .env}@db:5432/vision
+  REDIS_URL: redis://redis:6379/0
+  SECRET_KEY: ${SECRET_KEY:?Ejecuta scripts/init-env.sh para crear .env}
+  TZ: America/Santiago
+  TIMEZONE: America/Santiago
+  DATA_DIR: /data
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8180}
+  ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
+  API_DOCS: ${API_DOCS:-false}
+  DEFAULT_USER_QUOTA_MB: ${DEFAULT_USER_QUOTA_MB:-102400}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-15}
+  MAX_AUDIO_UPLOAD_MB: ${MAX_AUDIO_UPLOAD_MB:-50}
+  MAX_TABULAR_UPLOAD_MB: ${MAX_TABULAR_UPLOAD_MB:-50}
+  MIN_IMAGES_PER_CLASS: ${MIN_IMAGES_PER_CLASS:-10}
+  LOW_CONFIDENCE_THRESHOLD: ${LOW_CONFIDENCE_THRESHOLD:-0.6}
+  TOTAL_RAM_LIMIT_GB: ${TOTAL_RAM_LIMIT_GB:-20}
+  TRAIN_THREADS: ${TRAIN_THREADS:-0}
+  NIGHT_TRAINING_ENABLED: ${NIGHT_TRAINING_ENABLED:-true}
+  NIGHT_WINDOW_START: ${NIGHT_WINDOW_START:-00:00}
+  NIGHT_WINDOW_END: ${NIGHT_WINDOW_END:-08:00}
+  NIGHT_MAX_JOB_HOURS: ${NIGHT_MAX_JOB_HOURS:-4}
+  NIGHT_ACTIVITY_MINUTES: ${NIGHT_ACTIVITY_MINUTES:-15}
+  NIGHT_ASK_TIMEOUT_MINUTES: ${NIGHT_ASK_TIMEOUT_MINUTES:-20}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-}
+  SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+  HF_ENCRYPTION_KEY: ${HF_ENCRYPTION_KEY:-}
+  HF_IMPORT_MAX_GB: ${HF_IMPORT_MAX_GB:-5}
+  ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+  ADMIN_FIRST_NAME: ${ADMIN_FIRST_NAME:-Administrador}
+  ADMIN_LAST_NAME: ${ADMIN_LAST_NAME:-Vision Lab}
+
+x-backend: &backend
+  build: ./backend
+  image: vision-lab-backend
+  restart: unless-stopped
+  environment: *backend-env
+  volumes:
+    # DATA_PATH vacío = volumen Docker "data"; con una ruta (p. ej. E:/vision-datos o /mnt/disco2/vision)
+    # las imágenes, snapshots y modelos se guardan en ese disco.
+    - ${DATA_PATH:-data}:/data
+    # Temporales de entrenamiento (memmaps, checkpoints intermedios) en un volumen interno rápido:
+    # en Windows los discos montados (E:, D:) son varias veces más lentos dentro de Docker.
+    - work:/data/work
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vision
+      POSTGRES_DB: vision
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Ejecuta scripts/init-env.sh para crear .env}
+      TZ: America/Santiago
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    mem_limit: ${DB_MEM_LIMIT:-1g}
+    memswap_limit: ${DB_MEM_LIMIT:-1g}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vision -d vision"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "384mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    mem_limit: ${REDIS_MEM_LIMIT:-512m}
+    memswap_limit: ${REDIS_MEM_LIMIT:-512m}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *backend
+    command: ["api"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    mem_limit: ${API_MEM_LIMIT:-2g}
+    memswap_limit: ${API_MEM_LIMIT:-2g}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 6s
+      retries: 10
+      start_period: 40s
+
+  worker-train:
+    <<: *backend
+    command: ["worker-train"]
+    depends_on:
+      api: {condition: service_healthy}
+    mem_limit: ${TRAIN_MEM_LIMIT:-14g}
+    memswap_limit: ${TRAIN_MEM_LIMIT:-14g}
+    shm_size: 1g
+    healthcheck:
+      # el pool "solo" no responde a ping mientras entrena: se comprueba que el proceso exista
+      test: ["CMD-SHELL", "pgrep -f 'celery -A app.celery_app worker' > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker-light:
+    <<: *backend
+    command: ["worker-light"]
+    depends_on:
+      api: {condition: service_healthy}
+    mem_limit: ${LIGHT_MEM_LIMIT:-2g}
+    memswap_limit: ${LIGHT_MEM_LIMIT:-2g}
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d light@$$(hostname) --timeout 8 > /dev/null"]
+      interval: 30s
+      timeout: 12s
+      retries: 3
+      start_period: 30s
+
+  beat:
+    <<: *backend
+    command: ["beat"]
+    depends_on:
+      api: {condition: service_healthy}
+    mem_limit: ${BEAT_MEM_LIMIT:-256m}
+    memswap_limit: ${BEAT_MEM_LIMIT:-256m}
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'celery -A app.celery_app beat' > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    build: ./frontend
+    image: vision-lab-web
+    restart: unless-stopped
+    depends_on:
+      api: {condition: service_healthy}
+    ports:
+      # Detrás de Cloudflare Tunnel pon HTTP_BIND=127.0.0.1: así nadie puede llegar directo al puerto y falsear
+      # la cabecera CF-Connecting-IP (que el servidor usa como IP del cliente para los límites de intentos).
+      - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-8180}:80"
+    mem_limit: ${WEB_MEM_LIMIT:-128m}
+    memswap_limit: ${WEB_MEM_LIMIT:-128m}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+
+  # Conector de Cloudflare Tunnel opcional (perfil "tunnel"). En Cloudflare Zero Trust, el Public
+  # Hostname del túnel debe apuntar a: HTTP  web:80.
+  #   docker compose --profile tunnel up -d tunnel
+  tunnel:
+    image: cloudflare/cloudflared:2024.12.2
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      web: {condition: service_healthy}
+    mem_limit: 128m
+
+volumes:
+  pgdata:
+  redisdata:
+  data:
+  work:
